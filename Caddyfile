@@ -1,0 +1,69 @@
+{
+	email {$ACME_EMAIL}
+}
+
+(common) {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+	request_body {
+		max_size 50MB
+	}
+}
+
+# UI host: /api/* goes to the gateway with the demo key, everything else to the UI container
+(ui) {
+	import common
+	handle_path /api/* {
+		rewrite * /api/{args[0]}{path}?{query}
+		reverse_proxy dwaarpal:8000 {
+			header_up X-API-Key {$DEMO_API_KEY}
+		}
+	}
+	handle {
+		reverse_proxy {args[1]}:80
+	}
+}
+
+# raw API for anyone with their own key
+api.{$DOMAIN} {
+	import common
+	reverse_proxy dwaarpal:8000
+}
+
+kavach.{$DOMAIN} {
+	import ui kavach kavach-ui
+}
+
+hisaab.{$DOMAIN} {
+	import ui hisaab hisaab-ui
+}
+
+karya.{$DOMAIN} {
+	import ui karya karya-ui
+}
+
+sutra.{$DOMAIN} {
+	import ui sutra sutra-ui
+}
+
+status.{$DOMAIN} {
+	import ui sanjeevani sanjeevani-ui
+}
+
+# Dwaarpal's own UI talks to the gateway directly (/api/gateway/stats -> /gateway/stats)
+dwaarpal.{$DOMAIN} {
+	import common
+	handle_path /api/* {
+		reverse_proxy dwaarpal:8000 {
+			header_up X-API-Key {$DEMO_API_KEY}
+		}
+	}
+	handle {
+		reverse_proxy dwaarpal-ui:80
+	}
+}
