@@ -1,0 +1,221 @@
+x-ui: &ui
+  restart: unless-stopped
+  networks: [backend]
+  mem_limit: 32m
+
+x-app: &app
+  restart: unless-stopped
+  env_file: .env
+  networks: [backend]
+  depends_on:
+    postgres: { condition: service_healthy }
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }  # logs can never fill the disk
+
+# Workers have no HTTP server, so the image's /health check does not fit them. Their loops touch
+# /tmp/alive; a file older than 5 minutes means the loop is stuck.
+x-alive: &alive
+  healthcheck:
+    test: ["CMD", "python", "-c", "import os, sys, time; sys.exit(0 if time.time() - os.path.getmtime('/tmp/alive') < 300 else 1)"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment: { DOMAIN: "${DOMAIN}", ACME_EMAIL: "${ACME_EMAIL}", DEMO_API_KEY: "${DEMO_API_KEY}" }
+    networks: [backend]
+    mem_limit: 64m
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      postgres -c shared_buffers=128MB -c max_connections=80
+               -c work_mem=4MB -c maintenance_work_mem=64MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      retries: 5
+    networks: [backend]
+    mem_limit: 512m
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no --maxmemory 48mb --maxmemory-policy allkeys-lru
+    networks: [backend]
+    mem_limit: 64m
+
+  # Docker API for Sanjeevani only: read container info and restart, nothing else (no create,
+  # exec, kill or image access). Reachable only on the private docker_api network.
+  docker-proxy:
+    image: wollomatic/socket-proxy:1
+    container_name: docker-proxy
+    restart: unless-stopped
+    user: "65534:${DOCKER_GID:-0}"  # nobody, in the socket's group (Ubuntu: getent group docker)
+    command:
+      - "-loglevel=info"
+      - "-listenip=0.0.0.0"
+      - "-allowfrom=0.0.0.0/0"  # the docker_api network itself is the boundary
+      - '-allowGET=/(v1\.[0-9]+/)?(version|_ping|containers/json|containers/[a-zA-Z0-9_.-]+/json)'
+      - '-allowPOST=/v1\.[0-9]+/containers/[a-zA-Z0-9_.-]+/restart'
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+    networks: [docker_api]
+    mem_limit: 32m
+
+  kavach:
+    <<: *app
+    image: ghcr.io/${GH_USER}/kavach:${TAG:-latest}
+    container_name: kavach
+    environment:
+      APP_NAME: kavach
+      DATABASE_URL: postgresql+psycopg://kavach:${KAVACH_DB_PASSWORD}@postgres:5432/kavach
+    mem_limit: 150m
+
+  kavach-relay:
+    <<: [*app, *alive]
+    image: ghcr.io/${GH_USER}/kavach:${TAG:-latest}
+    container_name: kavach-relay
+    command: ["python", "-m", "app.relay"]
+    environment:
+      APP_NAME: kavach-relay
+      DATABASE_URL: postgresql+psycopg://kavach:${KAVACH_DB_PASSWORD}@postgres:5432/kavach
+      KARYA_URL: http://karya-api:8000
+    mem_limit: 100m
+
+  karya-api:
+    <<: *app
+    image: ghcr.io/${GH_USER}/karya:${TAG:-latest}
+    container_name: karya-api
+    environment:
+      APP_NAME: karya
+      DATABASE_URL: postgresql+psycopg://karya:${KARYA_DB_PASSWORD}@postgres:5432/karya
+    mem_limit: 150m
+
+  karya-worker:
+    <<: [*app, *alive]
+    image: ghcr.io/${GH_USER}/karya:${TAG:-latest}
+    container_name: karya-worker
+    command: ["python", "-m", "app.worker"]
+    environment:
+      APP_NAME: karya-worker
+      DATABASE_URL: postgresql+psycopg://karya:${KARYA_DB_PASSWORD}@postgres:5432/karya
+    stop_grace_period: 60s  # lets the current job finish on deploy
+    mem_limit: 150m
+
+  hisaab:
+    <<: *app
+    image: ghcr.io/${GH_USER}/hisaab:${TAG:-latest}
+    container_name: hisaab
+    environment:
+      APP_NAME: hisaab
+      DATABASE_URL: postgresql+psycopg://hisaab:${HISAAB_DB_PASSWORD}@postgres:5432/hisaab
+    volumes: ["hisaab_data:/data"]
+    mem_limit: 200m
+
+  hisaab-worker:
+    <<: [*app, *alive]
+    image: ghcr.io/${GH_USER}/hisaab:${TAG:-latest}
+    container_name: hisaab-worker
+    command: ["python", "-m", "app.worker"]
+    environment:
+      APP_NAME: hisaab-worker
+      DATABASE_URL: postgresql+psycopg://hisaab:${HISAAB_DB_PASSWORD}@postgres:5432/hisaab
+      POLARS_MAX_THREADS: "2"
+      # Polars' allocator returns freed memory right away (measured: 641 -> 545 MB peak at 1M rows)
+      _RJEM_MALLOC_CONF: "background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0"
+    volumes: ["hisaab_data:/data"]
+    mem_limit: 1g  # 1M-row benchmark peaks near 550 to 640 MB and is OOM-killed at 400 MB
+
+  dwaarpal:
+    <<: *app
+    image: ghcr.io/${GH_USER}/dwaarpal:${TAG:-latest}
+    container_name: dwaarpal
+    environment:
+      APP_NAME: dwaarpal
+      DATABASE_URL: postgresql+psycopg://dwaarpal:${DWAARPAL_DB_PASSWORD}@postgres:5432/dwaarpal
+      REDIS_URL: redis://redis:6379/0
+      ROUTES: '{"kavach":"http://kavach:8000","hisaab":"http://hisaab:8000","karya":"http://karya-api:8000","sutra":"http://sutra:8000","sanjeevani":"http://sanjeevani:8000"}'
+    mem_limit: 150m
+
+  sutra:
+    <<: *app
+    image: ghcr.io/${GH_USER}/sutra:${TAG:-latest}
+    container_name: sutra
+    environment:
+      APP_NAME: sutra
+      DATABASE_URL: postgresql+psycopg://sutra:${SUTRA_DB_PASSWORD}@postgres:5432/sutra
+      REDIS_URL: redis://redis:6379/1
+    volumes: ["sutra_data:/data", "models:/models"]
+    mem_limit: 500m
+
+  sutra-worker:
+    <<: [*app, *alive]
+    image: ghcr.io/${GH_USER}/sutra:${TAG:-latest}
+    container_name: sutra-worker
+    command: ["python", "-m", "app.worker"]
+    environment:
+      APP_NAME: sutra-worker
+      DATABASE_URL: postgresql+psycopg://sutra:${SUTRA_DB_PASSWORD}@postgres:5432/sutra
+    volumes: ["sutra_data:/data", "models:/models"]
+    mem_limit: 700m
+
+  sanjeevani:
+    <<: *app
+    image: ghcr.io/${GH_USER}/sanjeevani:${TAG:-latest}
+    container_name: sanjeevani
+    environment:
+      APP_NAME: sanjeevani
+      DATABASE_URL: postgresql+psycopg://sanjeevani:${SANJEEVANI_DB_PASSWORD}@postgres:5432/sanjeevani
+      DOCKER_URL: tcp://docker-proxy:2375  # manual restarts (admin token)
+    networks: [backend, docker_api]
+    mem_limit: 150m
+
+  sanjeevani-monitor:
+    <<: [*app, *alive]
+    image: ghcr.io/${GH_USER}/sanjeevani:${TAG:-latest}
+    container_name: sanjeevani-monitor
+    command: ["python", "-m", "app.monitor"]
+    environment:
+      APP_NAME: sanjeevani-monitor
+      DATABASE_URL: postgresql+psycopg://sanjeevani:${SANJEEVANI_DB_PASSWORD}@postgres:5432/sanjeevani
+      DOCKER_URL: tcp://docker-proxy:2375
+    networks: [backend, docker_api]
+    mem_limit: 150m
+
+  # static UIs (Step 3A), about 15 MB RAM each
+  kavach-ui:     { <<: *ui, image: "ghcr.io/${GH_USER}/kavach-ui:${TAG:-latest}", container_name: kavach-ui }
+  hisaab-ui:     { <<: *ui, image: "ghcr.io/${GH_USER}/hisaab-ui:${TAG:-latest}", container_name: hisaab-ui }
+  dwaarpal-ui:   { <<: *ui, image: "ghcr.io/${GH_USER}/dwaarpal-ui:${TAG:-latest}", container_name: dwaarpal-ui }
+  karya-ui:      { <<: *ui, image: "ghcr.io/${GH_USER}/karya-ui:${TAG:-latest}", container_name: karya-ui }
+  sutra-ui:      { <<: *ui, image: "ghcr.io/${GH_USER}/sutra-ui:${TAG:-latest}", container_name: sutra-ui }
+  sanjeevani-ui: { <<: *ui, image: "ghcr.io/${GH_USER}/sanjeevani-ui:${TAG:-latest}", container_name: sanjeevani-ui }
+
+networks:
+  backend: {}
+  docker_api: { internal: true }  # only docker-proxy and the two Sanjeevani containers
+
+volumes:
+  pgdata: {}
+  caddy_data: {}
+  caddy_config: {}
+  hisaab_data: {}
+  sutra_data: {}
+  models: {}
