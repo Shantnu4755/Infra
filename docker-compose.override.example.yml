@@ -1,0 +1,23 @@
+# Local development only. Copy to docker-compose.override.yml (gitignored; Compose loads it
+# automatically). It must never reach the server, where images come from GHCR.
+services:
+  caddy: { profiles: ["prod"] }             # not needed locally
+  kavach: { build: ../kavach }
+  kavach-relay: { build: ../kavach }
+  karya-api: { build: ../karya }
+  karya-worker: { build: ../karya }
+  hisaab: { build: ../hisaab }
+  hisaab-worker: { build: ../hisaab }
+  dwaarpal: { build: ../dwaarpal, ports: ["8080:8000"] }
+  sutra: { build: ../sutra }
+  sutra-worker: { build: ../sutra }
+  sanjeevani: { build: ../sanjeevani, ports: ["8081:8000"] }
+  sanjeevani-monitor: { build: ../sanjeevani }
+  postgres: { ports: ["5432:5432"] }
+  # UIs: built from each repo's Dockerfile.ui (Step 3A); `--profile ui` starts them
+  kavach-ui: { profiles: ["ui"], build: { context: ../kavach, dockerfile: Dockerfile.ui } }
+  hisaab-ui: { profiles: ["ui"], build: { context: ../hisaab, dockerfile: Dockerfile.ui } }
+  dwaarpal-ui: { profiles: ["ui"], build: { context: ../dwaarpal, dockerfile: Dockerfile.ui } }
+  karya-ui: { profiles: ["ui"], build: { context: ../karya, dockerfile: Dockerfile.ui } }
+  sutra-ui: { profiles: ["ui"], build: { context: ../sutra, dockerfile: Dockerfile.ui } }
+  sanjeevani-ui: { profiles: ["ui"], build: { context: ../sanjeevani, dockerfile: Dockerfile.ui } }
